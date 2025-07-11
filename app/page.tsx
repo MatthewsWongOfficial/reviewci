@@ -163,7 +163,7 @@ export default function CICDAnalyzer() {
             </div>
             {/* LinkedIn Profile Icon - Moved to top-right corner */}
             <a
-              href="https://linkedin.com/in/your-profile"
+              href="https://linkedin.com/in/matthewswong"
               target="_blank"
               rel="noopener noreferrer"
               className="absolute top-4 right-4 flex items-center gap-1 text-slate-600 hover:text-blue-600 transition-colors text-sm"
